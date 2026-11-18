@@ -50,9 +50,19 @@ Annotation tool is very useful when you want to highlight a specific area or dra
 
 - Ffmpeg [Optional], it will be downloaded if not found in system path.
 
-- Windows, MacOS, Linux: Debian based distros on Xorg, Classic or X11. No Wayland support yet. (see [How to switch to Xorg](https://itsfoss.com/switch-xorg-wayland/))
+- Windows, MacOS, Linux (X11 / Xorg).
 
-*Need help for Linux **Wayland** support. If you are interested, please create a pull request or open an issue.*
+- Linux **Wayland** (KDE Plasma 6, experimental): screen capture goes through the xdg-desktop-portal ScreenCast API and PipeWire, see [Wayland notes](#wayland-kde-plasma) below. Other Wayland desktops are untested.
+
+#### Wayland (KDE Plasma)
+
+Extra Python packages (installed automatically from `pyproject.toml`): `pipewire-capture`, `jeepney`. `busctl` (systemd) is used to talk to KWin.
+
+- Press Record: the portal asks which screen to share **once**; pypeek stores the approval per screen in `~/.peek/portal_restore_token_<screen>`. Choosing "Share full desktop (all screens)" is also supported and is shared between all screens. Delete the token files to be asked again.
+- The recording box you position in the window is recorded: its screen position is read from KWin (`org.kde.KWin.getWindowInfo`) because Wayland clients cannot query their own position. The mouse cursor is embedded in the frames.
+- If the box position cannot be determined (not KDE, or the portal stream is a single window), a frame is shown and you drag the region.
+- The window position and size are saved on close and restored through a one-shot KWin script.
+- After saving the recording or closing the editor the program exits.
 
 #### Known Issues:
 

@@ -1,4 +1,4 @@
-import os, shutil, time, subprocess, configparser, sys, requests, math, logging, tempfile
+import os, glob, threading, shutil, time, subprocess, configparser, sys, requests, math, logging, tempfile
 from math import atan2, pi
 from .shortcut import create_shortcut
 from .ffmpeg import get_ffmpeg
@@ -46,6 +46,47 @@ def init():
     
     capturer = Capturer()
 
+def kwin_window_rect(pid):
+    """KDE Wayland: global geometry (logical px) of this process' top-level window,
+    asked from KWin over D-Bus (Qt cannot know it on Wayland). None if unavailable."""
+    import json, re
+    def busctl(*args):
+        out = subprocess.run(["busctl", "--user", "--json=short", "call", "org.kde.KWin", *args],
+                             capture_output=True, text=True, timeout=3)
+        return json.loads(out.stdout)["data"][0] if out.returncode == 0 else None
+    try:
+        matches = busctl("/WindowsRunner", "org.kde.krunner1", "Match", "s", "Peek") or []
+        for m in matches:
+            uuid = re.search(r"\{[^}]+\}", m[0])
+            if not uuid:
+                continue
+            info = busctl("/KWin", "org.kde.KWin", "getWindowInfo", "s", uuid.group(0))
+            if info and info["pid"]["data"] == pid:
+                g = lambda k: info[k]["data"]
+                return QRectF(g("x"), g("y"), g("width"), g("height"))
+    except Exception as e:
+        logger.warning("KWin window lookup failed: %s", e)
+    return None
+
+def kwin_set_window_rect(pid, rect):
+    """KDE Wayland: move/resize our window through a one-shot KWin script
+    (Wayland clients may not position their own windows)."""
+    import json
+    js = os.path.join(user_path, "kwin_move.js")
+    with open(js, "w") as f:
+        f.write("for (const w of workspace.windowList()) { if (w.pid === %d) { "
+                "w.frameGeometry = {x: %d, y: %d, width: %d, height: %d}; } }\n"
+                % (pid, rect.x(), rect.y(), rect.width(), rect.height()))
+    try:
+        call = lambda *a: subprocess.run(["busctl", "--user", "--json=short", "call", "org.kde.KWin", *a],
+                                         capture_output=True, text=True, timeout=3)
+        out = call("/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", js, "pypeekmove")
+        script_id = json.loads(out.stdout)["data"][0]
+        call(f"/Scripting/Script{script_id}", "org.kde.kwin.Script", "run")
+        QTimer.singleShot(1500, lambda: call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", "pypeekmove"))
+    except Exception as e:
+        logger.warning("KWin move failed: %s", e)
+
 class PyPeek(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -57,6 +98,7 @@ class PyPeek(QMainWindow):
         capturer.run_timer_signal.connect(self.update_timer_ui)
         capturer.minimize_to_tray_signal.connect(self.do_minimize_to_tray)
         capturer.hide_app_signal.connect(self.hide)
+        capturer.wayland_region_signal.connect(self.choose_wayland_region)
 
         self.record_width = 506
         self.record_height = 406
@@ -125,6 +167,10 @@ class PyPeek(QMainWindow):
         self.move(self.pos_x, self.pos_y)
         self.setMinimumSize(self.minimum_header_width, self.minimum_body_height)
         self.show()
+        if QGuiApplication.platformName() == "wayland":
+            # KWin places new windows itself; reapply a few times until it sticks
+            for delay in (500, 1500, 3000):
+                QTimer.singleShot(delay, self.restore_wayland_geometry)
 
         self.drawover = DrawOver(None, self)
 
@@ -404,8 +450,23 @@ class PyPeek(QMainWindow):
         self.pos_x = config.getint('capture', 'pos_x', fallback=int((QGuiApplication.primaryScreen().size().width() - self.minimum_header_width) / 2))
         self.pos_y = config.getint('capture', 'pos_y', fallback=int(QGuiApplication.primaryScreen().size().height() * .5))
         self.check_update_on_startup = config.getboolean('capture', 'check_update_on_startup', fallback=False)
-    
+        self.wl_geometry = config.get('capture', 'wayland_geometry', fallback=None)
+
+    def restore_wayland_geometry(self):
+        try:
+            x, y, w, h = (int(float(v)) for v in self.wl_geometry.split(","))
+        except (AttributeError, ValueError):
+            return
+        kwin_set_window_rect(os.getpid(), QRect(x, y, w, h))
+
     def save_settings(self):
+        if QGuiApplication.platformName() == "wayland":
+            rect = kwin_window_rect(os.getpid())
+            if rect is not None:
+                self.wl_geometry = f"{rect.x():.0f},{rect.y():.0f},{rect.width():.0f},{rect.height():.0f}"
+        self._write_settings()
+
+    def _write_settings(self):
         config_file = os.path.join(user_path, 'peek.cfg')
         config = configparser.ConfigParser()
 
@@ -427,6 +488,8 @@ class PyPeek(QMainWindow):
             'pos_y': str(int(self.pos_y)),
             'check_update_on_startup': str(self.check_update_on_startup),
         }
+        if getattr(self, 'wl_geometry', None):
+            config['capture']['wayland_geometry'] = self.wl_geometry
 
         with open(config_file, 'w') as config_file:
             config.write(config_file)
@@ -501,6 +564,14 @@ class PyPeek(QMainWindow):
         self.hide_grips()
         capturer.pos_x, capturer.pos_y = PyPeek.get_global_position(self.record_area_widget, self.windowHandle().screen())
         capturer.width = self.record_area_widget.width() 
+        capturer.wayland_region_global = None
+        if capturer._is_wayland() and not capturer.fullscreen:
+            win = kwin_window_rect(os.getpid())
+            if win is not None:
+                off = self.record_area_widget.mapTo(self, QPoint(0, 0))
+                self.wl_geometry = f"{win.x():.0f},{win.y():.0f},{win.width():.0f},{win.height():.0f}"
+                capturer.wayland_region_global = QRectF(win.x() + off.x(), win.y() + off.y(),
+                                                       self.record_area_widget.width(), self.record_area_widget.height())
         capturer.height = self.record_area_widget.height()
         if not capturer.fullscreen:
             self.setFixedSize(self.record_width, self.record_height)
@@ -556,6 +627,11 @@ class PyPeek(QMainWindow):
         minutes = value // 60
         seconds = value % 60
         self.stop_button.setText(f'{minutes:01d}:{seconds:02d}')
+
+    def choose_wayland_region(self, image):
+        dlg = RegionSelectDialog(image)
+        dlg.exec()
+        capturer.set_wayland_region(dlg.result_rect)
 
     def screenshot(self):
         self.prepare_capture_ui()
@@ -708,6 +784,7 @@ class PyPeek(QMainWindow):
         self.show_info_layout()
 
     def closeEvent(self, event):
+        self.closing = True  # stop DrawOver.closeEvent from re-showing this window
         if capturer.isRunning():
             capturer.terminate()
             capturer.clear_cache_files()
@@ -1636,6 +1713,7 @@ class DrawOver(QMainWindow):
                 try:
                     shutil.move(filepath, new_filepath[0])
                     self.last_save_path = os.path.dirname(new_filepath[0])
+                    QTimer.singleShot(0, self.close)
                 except Exception as e:
                     logger.error(e)
 
@@ -1663,6 +1741,7 @@ class DrawOver(QMainWindow):
                 #     pixmap.save(new_filepath[0], ext, 60 if self.quality == "md" else 100)
                 shutil.copy(self.image_path, new_filepath[0])
                 self.last_save_path = os.path.dirname(new_filepath[0])
+                QTimer.singleShot(0, self.close)
             except Exception as e:
                 logger.error(e)
 
@@ -2119,7 +2198,11 @@ class DrawOver(QMainWindow):
         self.save_settings()
         # check if self has self.try_lock_thread.terminate()
         self.try_lock_thread and self.try_lock_thread.terminate()
-        self._parent and self._parent.reset_ui()
+        if self._parent and not getattr(self._parent, 'closing', False):
+            # Editor closed or file saved: we are done, end the program
+            self._parent.closing = True
+            self._parent.save_settings()
+            QTimer.singleShot(0, QApplication.quit)
     
     def try_lock(self):
         self.try_lock_thread = TryLock()
@@ -2151,6 +2234,96 @@ class DrawOver(QMainWindow):
         divider.setStyleSheet("QWidget { background-color: #444; }")
         return divider
 
+class RegionSelectDialog(QDialog):
+    """Shows one captured Wayland frame; the user drags a region on it.
+    Enter / double click = confirm, Esc = cancel, button = whole window."""
+
+    def __init__(self, image):
+        super().__init__()
+        self.setWindowTitle("Peek - drag to select the recording region")
+        self.image = image
+        self.result_rect = None
+        self.origin = None
+        self.sel = None  # selection in widget coordinates
+
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        pixmap = QPixmap.fromImage(image)
+        pixmap.setDevicePixelRatio(1)
+        self.pixmap = pixmap.scaled(int(screen.width() * .9), int(screen.height() * .8),
+                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation)
+        self.scale = image.width() / self.pixmap.width()
+
+        layout = QVBoxLayout(self)
+        self.canvas = QLabel()
+        self.canvas.setPixmap(self.pixmap)
+        self.canvas.setFixedSize(self.pixmap.size())
+        self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        self.canvas.installEventFilter(self)
+        layout.addWidget(self.canvas)
+
+        row = QHBoxLayout()
+        self.hint = QLabel("Drag to select a region, Enter to start")
+        whole = QPushButton("Whole window")
+        whole.clicked.connect(self.use_whole)
+        ok = QPushButton("Start")
+        ok.setDefault(True)
+        ok.clicked.connect(self.confirm)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(self.hint, 1)
+        row.addWidget(whole)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        layout.addLayout(row)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.canvas:
+            t = ev.type()
+            if t == QEvent.Type.MouseButtonPress and ev.button() == Qt.MouseButton.LeftButton:
+                self.origin = ev.position().toPoint()
+                self.sel = QRect(self.origin, QSize())
+                return True
+            if t == QEvent.Type.MouseMove and self.origin is not None:
+                self.sel = QRect(self.origin, ev.position().toPoint()).normalized().intersected(self.canvas.rect())
+                self.update_overlay()
+                return True
+            if t == QEvent.Type.MouseButtonRelease and self.origin is not None:
+                self.origin = None
+                return True
+            if t == QEvent.Type.MouseButtonDblClick:
+                self.confirm()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def update_overlay(self):
+        pm = self.pixmap.copy()
+        if self.sel is not None and not self.sel.isEmpty():
+            p = QPainter(pm)
+            p.setPen(QPen(QColor("#0d6efd"), 2))
+            p.setBrush(QColor(13, 110, 253, 50))
+            p.drawRect(self.sel)
+            p.end()
+            r = self.real_rect()
+            self.hint.setText(f"{r.width()} x {r.height()}  -  Enter to start")
+        self.canvas.setPixmap(pm)
+
+    def real_rect(self):
+        s = self.scale
+        r = QRect(int(self.sel.x() * s), int(self.sel.y() * s), int(self.sel.width() * s), int(self.sel.height() * s))
+        return r.intersected(self.image.rect())
+
+    def use_whole(self):
+        self.result_rect = self.image.rect()
+        self.accept()
+
+    def confirm(self):
+        if self.sel is None or self.sel.width() < 8 or self.sel.height() < 8:
+            self.result_rect = self.image.rect()  # nothing drawn: whole window
+        else:
+            self.result_rect = self.real_rect()
+        self.accept()
+
 class Capturer(QThread):
     recording_done_signal = Signal(str)
     encoding_done_signal = Signal(str)
@@ -2162,6 +2335,7 @@ class Capturer(QThread):
     minimize_to_tray_signal = Signal()
     hide_app_signal = Signal()
     progress_signal = Signal(str)
+    wayland_region_signal = Signal(QImage)
 
     def __init__(self):
         super().__init__()
@@ -2205,6 +2379,64 @@ class Capturer(QThread):
         self.wayland_session = None
         self.wayland_stream = None
         self.wayland_capture_started = False
+        self.wayland_crop = None  # QRect in stream pixels, None = whole stream
+        self.wayland_region_global = None  # QRectF of the record box in global logical px
+        self._region_event = threading.Event()
+        self._region_result = None
+
+    def set_wayland_region(self, rect):
+        """Called from the GUI thread with the chosen QRect (or None = cancelled)."""
+        self._region_result = rect
+        self._region_event.set()
+
+    def _crop_from_screen_stream(self, image):
+        """Map the record box the user positioned onto a whole-screen stream."""
+        r = self.wayland_region_global
+        if r is None or r.isEmpty():
+            return None
+        screen = self._box_screen()
+        if screen is None:
+            return None
+        g = screen.geometry()
+        if abs(image.width() / image.height() - g.width() / g.height()) > 0.01 * (g.width() / g.height()):
+            g = self._desktop_rect()  # stream shows the whole desktop
+        sx, sy = image.width() / g.width(), image.height() / g.height()
+        if abs(sx - sy) / max(sx, sy) > 0.01:
+            return None  # stream is neither this screen nor the whole desktop
+        crop = QRect(round((r.x() - g.x()) * sx), round((r.y() - g.y()) * sy),
+                     round(r.width() * sx) & ~1, round(r.height() * sy) & ~1).intersected(image.rect())
+        if crop.width() < 2 or crop.height() < 2:
+            return None
+        return QRect(crop.x(), crop.y(), crop.width() & ~1, crop.height() & ~1)
+
+    def _pick_wayland_region(self):
+        """Ask the user (GUI thread) to drag a region inside the portal stream.
+        Returns False if the user cancelled. Whole-screen mode skips this."""
+        self.wayland_crop = None
+        if self.fullscreen:
+            return True
+        image = self._get_wayland_image()
+        if image is None:
+            return True
+        crop = self._crop_from_screen_stream(image)
+        if crop is not None:
+            self.wayland_crop = crop
+            return True
+        # Stream is not a whole screen (e.g. a single window was picked): ask once.
+        self._region_event.clear()
+        self._region_result = None
+        self.wayland_region_signal.emit(image)
+        self._region_event.wait()
+        rect = self._region_result
+        if rect is None:
+            return False
+        # even dimensions keep mp4/webm encoders happy
+        w, h = rect.width() & ~1, rect.height() & ~1
+        if w < 2 or h < 2:
+            return False
+        if (w, h) != (image.width(), image.height()):
+            self.wayland_crop = QRect(rect.x(), rect.y(), w, h)
+        return True
 
     def _is_wayland(self):
         return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
@@ -2216,12 +2448,44 @@ class Capturer(QThread):
             return True
 
         try:
-            from pipewire_capture import PortalCapture, CaptureStream
+            from pipewire_capture import CaptureStream
+            from .portal import ScreenCastSession
 
             logger.info("Starting Wayland portal capture")
 
-            portal = PortalCapture()
-            session = portal.select_window()
+            screen = self._box_screen()
+            token_file = os.path.join(user_path, f"portal_restore_token_{screen.name() if screen else 'default'}")
+            if screen is None and not os.path.exists(token_file):
+                # fullscreen mode has no box: reuse the newest saved approval
+                saved = sorted(glob.glob(os.path.join(user_path, "portal_restore_token_*")), key=os.path.getmtime)
+                saved and shutil.copy(saved[-1], token_file)
+            for attempt in (1, 2):
+                session = ScreenCastSession(token_file)
+                self.wayland_session = session
+                session.open()
+                chosen = self._choose_stream(session.streams, screen)
+                if chosen is not None or screen is None:
+                    break
+                # Saved approval was for another screen: forget it and ask again.
+                logger.info("Approved screen does not match the record box, asking again")
+                session.close()
+                self.wayland_session = None
+                try:
+                    os.remove(token_file)
+                except OSError:
+                    pass
+            if chosen is None:
+                chosen = session.streams[0][:3]
+            session.node_id, session.width, session.height = chosen
+            union = self._desktop_rect()
+            if chosen[1] and chosen[2] and abs(chosen[1] / chosen[2] - union.width() / union.height()) < 0.01 \
+                    and os.path.exists(token_file):
+                # a "whole desktop" approval is valid for every screen: share it
+                targets = [os.path.join(user_path, f"portal_restore_token_{sc.name()}") for sc in QGuiApplication.screens()]
+                targets.append(os.path.join(user_path, "portal_restore_token_default"))
+                for target in targets:
+                    if os.path.abspath(target) != os.path.abspath(token_file):
+                        shutil.copy(token_file, target)
 
             if session is None or not session.is_open:
                 logger.error("Wayland portal session was not opened")
@@ -2273,6 +2537,39 @@ class Capturer(QThread):
             )
             self._stop_wayland_capture()
             return False
+
+    def _box_screen(self):
+        r = self.wayland_region_global
+        if r is None:
+            return None
+        for sc in QGuiApplication.screens():
+            if sc.geometry().contains(r.center().toPoint()):
+                return sc
+        return None
+
+    def _choose_stream(self, streams, screen):
+        """Return (node, w, h) of the approved stream showing `screen`, else None."""
+        if screen is None:
+            return streams[0][:3]
+        g = screen.geometry()
+        for node, w, h, x, y in streams:
+            if x is not None and (x, y) == (g.x(), g.y()):
+                return node, w, h
+        for node, w, h, x, y in streams:  # no position info: match aspect ratio
+            if x is None and w and h and abs(w / h - g.width() / g.height()) < 0.01:
+                return node, w, h
+        union = self._desktop_rect()
+        for node, w, h, x, y in streams:  # "share full desktop": one stream for all screens
+            if w and h and abs(w / h - union.width() / union.height()) < 0.01:
+                return node, w, h
+        return None
+
+    @staticmethod
+    def _desktop_rect():
+        rect = QRect()
+        for sc in QGuiApplication.screens():
+            rect = rect.united(sc.geometry())
+        return rect
 
     def _stop_wayland_capture(self):
         """Stop the PipeWire stream and close the portal session."""
@@ -2358,7 +2655,8 @@ class Capturer(QThread):
             time.sleep(.2) # give the app time to move to the tray
 
             if self._is_wayland():
-                if not self._start_wayland_capture():
+                if not self._start_wayland_capture() or not self._pick_wayland_region():
+                    self._stop_wayland_capture()
                     self.capture_stopped_signal.emit()
                     self.quit()
                     return
@@ -2412,7 +2710,8 @@ class Capturer(QThread):
             time.sleep(.2) # give app time to hide
 
             if self._is_wayland():
-                if not self._start_wayland_capture():
+                if not self._start_wayland_capture() or not self._pick_wayland_region():
+                    self._stop_wayland_capture()
                     self.capture_stopped_signal.emit()
                     self.quit()
                     return
@@ -2598,13 +2897,8 @@ class Capturer(QThread):
                 logger.error("No Wayland frame available")
                 return None
 
-            if not self.fullscreen:
-                screenshot = screenshot.copy(
-                    self.pos_x,
-                    self.pos_y,
-                    self.width,
-                    self.height,
-                )
+            if self.wayland_crop is not None:
+                screenshot = screenshot.copy(self.wayland_crop)
 
             os.makedirs(self.current_cache_folder, exist_ok=True)
 
